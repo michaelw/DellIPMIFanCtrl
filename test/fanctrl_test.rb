@@ -109,7 +109,161 @@ class FanctrlTest < Minitest::Test
     assert_equal 'Temp: 48.4C -> Fans: 26%', message
   end
 
+  def test_deadband_defaults_to_five_percentage_points
+    assert_equal 5, DellIPMIFanCtrl.deadband({})
+  end
+
+  def test_deadband_accepts_zero_and_boundaries
+    assert_equal 0, DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => '0')
+    assert_equal 100, DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => '100')
+  end
+
+  def test_deadband_accepts_an_override
+    assert_equal 7, DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => '7')
+  end
+
+  def test_deadband_rejects_invalid_values
+    ['2.5', '-1', '101', 'nope'].each do |value|
+      error = assert_raises(ArgumentError) do
+        DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => value)
+      end
+
+      assert_includes error.message, 'FANCTRL_DEADBAND'
+      assert_includes error.message, value
+    end
+  end
+
+  def test_speed_update_is_immediate_for_any_increase
+    assert DellIPMIFanCtrl.speed_update_required?(target: 26, applied: 25, deadband: 5)
+    assert DellIPMIFanCtrl.speed_update_required?(target: 35, applied: 25, deadband: 5)
+  end
+
+  def test_speed_update_holds_small_decreases_and_identical_targets
+    refute DellIPMIFanCtrl.speed_update_required?(target: 25, applied: 25, deadband: 5)
+    refute DellIPMIFanCtrl.speed_update_required?(target: 21, applied: 25, deadband: 5)
+  end
+
+  def test_speed_update_applies_decrease_at_configured_boundary
+    assert DellIPMIFanCtrl.speed_update_required?(target: 20, applied: 25, deadband: 5)
+    assert DellIPMIFanCtrl.speed_update_required?(target: 18, applied: 25, deadband: 5)
+  end
+
+  def test_zero_deadband_applies_every_integer_change_but_not_identical_targets
+    assert DellIPMIFanCtrl.speed_update_required?(target: 24, applied: 25, deadband: 0)
+    refute DellIPMIFanCtrl.speed_update_required?(target: 25, applied: 25, deadband: 0)
+  end
+
+  def test_manual_controller_retries_failed_speed_write
+    output = StringIO.new
+    attempts = 0
+    controller = build_controller(output: output) do
+      attempts += 1
+      attempts > 1
+    end
+
+    controller.step(40.0, now: 0)
+    assert_nil controller.applied_fan_speed
+
+    controller.step(40.0, now: 5)
+    assert_equal 10, controller.applied_fan_speed
+    assert_equal 2, attempts
+  end
+
+  def test_manual_controller_applies_increases_immediately_and_holds_small_decreases
+    writes = []
+    controller = build_controller { |speed| writes << speed; true }
+
+    controller.step(40.0, now: 0)
+    controller.step(40.6, now: 5)
+    controller.step(40.2, now: 10)
+
+    assert_equal [10, 11], writes
+    assert_equal 11, controller.applied_fan_speed
+  end
+
+  def test_manual_controller_applies_decrease_at_deadband_boundary
+    writes = []
+    controller = build_controller { |speed| writes << speed; true }
+
+    controller.step(50.0, now: 0)
+    controller.step(47.5, now: 5)
+
+    assert_equal [30, 25], writes
+  end
+
+  def test_different_deadbands_change_the_same_temperature_sequence
+    five_point_writes = []
+    five_point_controller = build_controller(deadband: 5) do |speed|
+      five_point_writes << speed
+      true
+    end
+    two_point_writes = []
+    two_point_controller = build_controller(deadband: 2) do |speed|
+      two_point_writes << speed
+      true
+    end
+
+    [50.0, 48.5].each_with_index do |temp, index|
+      five_point_controller.step(temp, now: index * 5)
+      two_point_controller.step(temp, now: index * 5)
+    end
+
+    assert_equal [30], five_point_writes
+    assert_equal [30, 27], two_point_writes
+  end
+
+  def test_automatic_cutoff_is_immediate_and_manual_reentry_reapplies_target
+    modes = []
+    writes = []
+    controller = build_controller(
+      manual_writer: ->(enabled) { modes << enabled; true },
+    ) { |speed| writes << speed; true }
+
+    controller.step(64.9, now: 0)
+    controller.step(65.0, now: 5)
+    controller.step(64.9, now: 10)
+
+    assert_equal [true, false, true], modes
+    assert_equal [52, 52], writes
+  end
+
+  def test_logging_is_immediate_for_changes_and_quiet_between_heartbeats
+    output = StringIO.new
+    controller = build_controller(output: output) { true }
+
+    controller.step(40.0, now: 0)
+    controller.step(39.9, now: 5)
+    controller.step(39.9, now: 299)
+    assert_equal 1, output.string.lines.count
+
+    controller.step(39.9, now: 300)
+    assert_equal 2, output.string.lines.count
+    assert_includes output.string.lines.last, 'held'
+    assert_includes output.string.lines.last, 'target: 9%'
+  end
+
+  def test_logging_is_immediate_for_mode_and_applied_speed_changes
+    output = StringIO.new
+    controller = build_controller(output: output) { true }
+
+    controller.step(40.0, now: 0)
+    controller.step(40.6, now: 5)
+    controller.step(65.0, now: 10)
+
+    assert_equal 3, output.string.lines.count
+    assert_equal 'Temp: 65.0C -> Dell Automated Fan Speed (manual cutoff = 65)', output.string.lines.last.chomp
+  end
+
   private
+
+  def build_controller(deadband: 5, output: StringIO.new, manual_writer: ->(_enabled) { true }, &speed_writer)
+    DellIPMIFanCtrl::Controller.new(
+      deadband: deadband,
+      output: output,
+      manual_writer: manual_writer,
+      speed_writer: speed_writer,
+    )
+  end
 
   def recording_runner(success: true, stderr: '')
     lambda do |*command|
