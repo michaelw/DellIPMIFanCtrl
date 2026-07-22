@@ -41,6 +41,16 @@ module DellIPMIFanCtrl
     power
   end
 
+  def status_message(temp, manual:, fan_speed:)
+    fan_status = if manual
+                   "Fans: #{fan_speed.to_i}%"
+                 else
+                   "Dell Automated Fan Speed (manual cutoff = #{MANUAL_CUTOFF})"
+                 end
+
+    format('Temp: %.1fC -> %s', temp, fan_status)
+  end
+
   def product_name
     File.read('/sys/class/dmi/id/product_name').delete("\0").strip
   rescue SystemCallError
@@ -80,7 +90,7 @@ if $PROGRAM_NAME == __FILE__
     manual = temp < DellIPMIFanCtrl::MANUAL_CUTOFF
     fan_speed = DellIPMIFanCtrl.get_fan_speed(temp)
 
-    puts "Temp: #{temp}C -> #{manual ? "Fans: #{fan_speed}%" : "Dell Automated Fan Speed (manual cutoff = #{DellIPMIFanCtrl::MANUAL_CUTOFF})"}"
+    puts DellIPMIFanCtrl.status_message(temp, manual: manual, fan_speed: fan_speed)
 
     DellIPMIFanCtrl.set_manual_fan_ctrl(manual)
     DellIPMIFanCtrl.set_fan_speed(fan_speed) if manual
