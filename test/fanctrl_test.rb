@@ -91,6 +91,24 @@ class FanctrlTest < Minitest::Test
     assert_equal R210II_ERROR, warning.string
   end
 
+  def test_manual_status_message_formats_temperature_and_applied_fan_duty
+    message = DellIPMIFanCtrl.status_message(40.68181818181818, manual: true, fan_speed: 11.36363636363636)
+
+    assert_equal 'Temp: 40.7C -> Fans: 11%', message
+  end
+
+  def test_automatic_status_message_formats_temperature
+    message = DellIPMIFanCtrl.status_message(65.049, manual: false, fan_speed: 52.3)
+
+    assert_equal 'Temp: 65.0C -> Dell Automated Fan Speed (manual cutoff = 65)', message
+  end
+
+  def test_status_message_does_not_expose_floating_point_artifacts
+    message = DellIPMIFanCtrl.status_message(48.405, manual: true, fan_speed: 26.810000000000002)
+
+    assert_equal 'Temp: 48.4C -> Fans: 26%', message
+  end
+
   private
 
   def recording_runner(success: true, stderr: '')
