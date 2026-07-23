@@ -22,11 +22,16 @@ Stopping the service restores Dell automatic fan control.
 
 You can change the fan profile by editing `fanctrl.rb`
 
-## Fan speed deadband
+## Fan speed stabilization
 
-The controller checks the temperature every five seconds. Fan-speed increases are applied immediately, while decreases are held until the calculated target is at least five percentage points below the currently applied duty. This avoids repeated IPMI writes caused by small temperature fluctuations without delaying additional cooling. Unchanged state is logged every five minutes; applied changes and automatic/manual mode transitions are logged immediately.
+The controller checks the temperature every five seconds. Fan-speed increases are applied immediately. A decrease is applied only when the calculated target remains below the applied duty for a full observation interval, and each decrease is limited to a small step. This avoids large downward changes that can make the temperature rebound while still converging to a stable curve target. Unchanged state is logged every five minutes; applied changes and automatic/manual mode transitions are logged immediately.
 
-Set `FANCTRL_DEADBAND` to change the downward deadband. It accepts a whole number from `0` through `100` and defaults to `5`. A value of `0` applies every integer fan-speed change while still skipping writes when the target is unchanged.
+The downward controls are configurable:
+
+- `FANCTRL_DECREASE_INTERVAL` is the required sustained-low interval in seconds and defaults to `60`.
+- `FANCTRL_DECREASE_STEP` is the maximum percentage-point decrease per interval and defaults to `1`.
+
+Both values must be positive whole numbers, and the step cannot exceed `100`. With the defaults, a stable target of 21% converges from 26% through 25%, 24%, 23%, 22%, and 21% over five minutes. Any required increase remains immediate.
 
 For a systemd installation, use a service override:
 
@@ -38,7 +43,8 @@ Add the following, then restart the service:
 
 ```
 [Service]
-Environment=FANCTRL_DEADBAND=3
+Environment=FANCTRL_DECREASE_INTERVAL=30
+Environment=FANCTRL_DECREASE_STEP=1
 ```
 
 Invalid values prevent the controller from starting and produce a configuration error in the service journal.

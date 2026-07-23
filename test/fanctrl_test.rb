@@ -109,48 +109,41 @@ class FanctrlTest < Minitest::Test
     assert_equal 'Temp: 48.4C -> Fans: 26%', message
   end
 
-  def test_deadband_defaults_to_five_percentage_points
-    assert_equal 5, DellIPMIFanCtrl.deadband({})
+  def test_decrease_controls_have_conservative_defaults
+    assert_equal 60, DellIPMIFanCtrl.decrease_interval({})
+    assert_equal 1, DellIPMIFanCtrl.decrease_step({})
   end
 
-  def test_deadband_accepts_zero_and_boundaries
-    assert_equal 0, DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => '0')
-    assert_equal 100, DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => '100')
+  def test_decrease_controls_accept_overrides
+    env = {
+      'FANCTRL_DECREASE_INTERVAL' => '30',
+      'FANCTRL_DECREASE_STEP' => '2',
+    }
+
+    assert_equal 30, DellIPMIFanCtrl.decrease_interval(env)
+    assert_equal 2, DellIPMIFanCtrl.decrease_step(env)
   end
 
-  def test_deadband_accepts_an_override
-    assert_equal 7, DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => '7')
-  end
-
-  def test_deadband_rejects_invalid_values
-    ['2.5', '-1', '101', 'nope'].each do |value|
+  def test_decrease_interval_rejects_invalid_values
+    ['0', '2.5', '-1', 'nope'].each do |value|
       error = assert_raises(ArgumentError) do
-        DellIPMIFanCtrl.deadband('FANCTRL_DEADBAND' => value)
+        DellIPMIFanCtrl.decrease_interval('FANCTRL_DECREASE_INTERVAL' => value)
       end
 
-      assert_includes error.message, 'FANCTRL_DEADBAND'
+      assert_includes error.message, 'FANCTRL_DECREASE_INTERVAL'
       assert_includes error.message, value
     end
   end
 
-  def test_speed_update_is_immediate_for_any_increase
-    assert DellIPMIFanCtrl.speed_update_required?(target: 26, applied: 25, deadband: 5)
-    assert DellIPMIFanCtrl.speed_update_required?(target: 35, applied: 25, deadband: 5)
-  end
+  def test_decrease_step_rejects_invalid_values
+    ['0', '2.5', '-1', '101', 'nope'].each do |value|
+      error = assert_raises(ArgumentError) do
+        DellIPMIFanCtrl.decrease_step('FANCTRL_DECREASE_STEP' => value)
+      end
 
-  def test_speed_update_holds_small_decreases_and_identical_targets
-    refute DellIPMIFanCtrl.speed_update_required?(target: 25, applied: 25, deadband: 5)
-    refute DellIPMIFanCtrl.speed_update_required?(target: 21, applied: 25, deadband: 5)
-  end
-
-  def test_speed_update_applies_decrease_at_configured_boundary
-    assert DellIPMIFanCtrl.speed_update_required?(target: 20, applied: 25, deadband: 5)
-    assert DellIPMIFanCtrl.speed_update_required?(target: 18, applied: 25, deadband: 5)
-  end
-
-  def test_zero_deadband_applies_every_integer_change_but_not_identical_targets
-    assert DellIPMIFanCtrl.speed_update_required?(target: 24, applied: 25, deadband: 0)
-    refute DellIPMIFanCtrl.speed_update_required?(target: 25, applied: 25, deadband: 0)
+      assert_includes error.message, 'FANCTRL_DECREASE_STEP'
+      assert_includes error.message, value
+    end
   end
 
   def test_manual_controller_retries_failed_speed_write
@@ -169,47 +162,109 @@ class FanctrlTest < Minitest::Test
     assert_equal 2, attempts
   end
 
-  def test_manual_controller_applies_increases_immediately_and_holds_small_decreases
+  def test_manual_controller_applies_increases_immediately
     writes = []
     controller = build_controller { |speed| writes << speed; true }
 
     controller.step(40.0, now: 0)
     controller.step(40.6, now: 5)
-    controller.step(40.2, now: 10)
 
     assert_equal [10, 11], writes
     assert_equal 11, controller.applied_fan_speed
   end
 
-  def test_manual_controller_applies_decrease_at_deadband_boundary
+  def test_manual_controller_requires_a_persistent_lower_target
     writes = []
     controller = build_controller { |speed| writes << speed; true }
 
-    controller.step(50.0, now: 0)
-    controller.step(47.5, now: 5)
+    controller.step(48.0, now: 0)
+    controller.step(45.5, now: 5)
+    controller.step(45.5, now: 64)
 
-    assert_equal [30, 25], writes
+    assert_equal [26], writes
   end
 
-  def test_different_deadbands_change_the_same_temperature_sequence
-    five_point_writes = []
-    five_point_controller = build_controller(deadband: 5) do |speed|
-      five_point_writes << speed
-      true
-    end
-    two_point_writes = []
-    two_point_controller = build_controller(deadband: 2) do |speed|
-      two_point_writes << speed
-      true
+  def test_manual_controller_lowers_one_point_after_a_persistent_window
+    writes = []
+    controller = build_controller { |speed| writes << speed; true }
+
+    controller.step(48.0, now: 0)
+    controller.step(45.5, now: 5)
+    controller.step(45.5, now: 65)
+
+    assert_equal [26, 25], writes
+  end
+
+  def test_manual_controller_eventually_converges_to_a_stable_curve_target
+    writes = []
+    controller = build_controller { |speed| writes << speed; true }
+
+    controller.step(48.0, now: 0)
+    [5, 65, 125, 185, 245, 305].each do |now|
+      controller.step(45.5, now: now)
     end
 
-    [50.0, 48.5].each_with_index do |temp, index|
-      five_point_controller.step(temp, now: index * 5)
-      two_point_controller.step(temp, now: index * 5)
+    assert_equal [26, 25, 24, 23, 22, 21], writes
+    assert_equal 21, controller.applied_fan_speed
+  end
+
+  def test_manual_controller_uses_the_highest_target_in_the_window
+    writes = []
+    controller = build_controller { |speed| writes << speed; true }
+
+    controller.step(48.0, now: 0)
+    controller.step(45.5, now: 5)
+    controller.step(47.5, now: 30)
+    controller.step(45.5, now: 65)
+
+    assert_equal [26, 25], writes
+  end
+
+  def test_manual_controller_resets_decrease_window_when_target_recovers
+    writes = []
+    controller = build_controller { |speed| writes << speed; true }
+
+    controller.step(48.0, now: 0)
+    controller.step(45.5, now: 5)
+    controller.step(48.0, now: 30)
+    controller.step(45.5, now: 35)
+    controller.step(45.5, now: 94)
+
+    assert_equal [26], writes
+  end
+
+  def test_manual_controller_honors_configured_decrease_step
+    writes = []
+    controller = build_controller(decrease_step: 2) { |speed| writes << speed; true }
+
+    controller.step(48.0, now: 0)
+    controller.step(40.0, now: 5)
+    controller.step(40.0, now: 65)
+
+    assert_equal [26, 24], writes
+  end
+
+  def test_manual_controller_retries_failed_decrease
+    writes = []
+    fail_decrease_once = true
+    controller = build_controller do |speed|
+      writes << speed
+      if speed == 25 && fail_decrease_once
+        fail_decrease_once = false
+        false
+      else
+        true
+      end
     end
 
-    assert_equal [30], five_point_writes
-    assert_equal [30, 27], two_point_writes
+    controller.step(48.0, now: 0)
+    controller.step(45.5, now: 5)
+    controller.step(45.5, now: 65)
+    assert_equal 26, controller.applied_fan_speed
+
+    controller.step(45.5, now: 70)
+    assert_equal [26, 25, 25], writes
+    assert_equal 25, controller.applied_fan_speed
   end
 
   def test_automatic_cutoff_is_immediate_and_manual_reentry_reapplies_target
@@ -229,7 +284,7 @@ class FanctrlTest < Minitest::Test
 
   def test_logging_is_immediate_for_changes_and_quiet_between_heartbeats
     output = StringIO.new
-    controller = build_controller(output: output) { true }
+    controller = build_controller(decrease_interval: 600, output: output) { true }
 
     controller.step(40.0, now: 0)
     controller.step(39.9, now: 5)
@@ -256,9 +311,16 @@ class FanctrlTest < Minitest::Test
 
   private
 
-  def build_controller(deadband: 5, output: StringIO.new, manual_writer: ->(_enabled) { true }, &speed_writer)
+  def build_controller(
+    decrease_interval: 60,
+    decrease_step: 1,
+    output: StringIO.new,
+    manual_writer: ->(_enabled) { true },
+    &speed_writer
+  )
     DellIPMIFanCtrl::Controller.new(
-      deadband: deadband,
+      decrease_interval: decrease_interval,
+      decrease_step: decrease_step,
       output: output,
       manual_writer: manual_writer,
       speed_writer: speed_writer,
