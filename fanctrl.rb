@@ -14,6 +14,9 @@ module DellIPMIFanCtrl
 
   MANUAL_CUTOFF = 65  # When to disable OS fan control
   DT = 5              # Check every DT seconds
+  DEFAULT_DECREASE_INTERVAL = 60
+  DEFAULT_DECREASE_STEP = 1
+  STATUS_LOG_INTERVAL = 300
   R210II_PRODUCT_NAME = 'PowerEdge R210 II'.freeze
   R210II_SPEED_ERROR = /rsp=0xcc\).*Invalid data field in request/m.freeze
 
@@ -41,9 +44,35 @@ module DellIPMIFanCtrl
     power
   end
 
-  def status_message(temp, manual:, fan_speed:)
+  def decrease_interval(env = ENV)
+    value = env.fetch('FANCTRL_DECREASE_INTERVAL', DEFAULT_DECREASE_INTERVAL.to_s)
+    parsed = Integer(value, 10)
+    return parsed if parsed.positive?
+
+    raise ArgumentError
+  rescue ArgumentError
+    raise ArgumentError, "FANCTRL_DECREASE_INTERVAL must be a positive whole number of seconds (got #{value.inspect})"
+  end
+
+  def decrease_step(env = ENV)
+    value = env.fetch('FANCTRL_DECREASE_STEP', DEFAULT_DECREASE_STEP.to_s)
+    parsed = Integer(value, 10)
+    return parsed if parsed.between?(1, 100)
+
+    raise ArgumentError
+  rescue ArgumentError
+    raise ArgumentError, "FANCTRL_DECREASE_STEP must be a whole number from 1 to 100 (got #{value.inspect})"
+  end
+
+  def status_message(temp, manual:, fan_speed:, target_fan_speed: nil)
     fan_status = if manual
-                   "Fans: #{fan_speed.to_i}%"
+                   if fan_speed.nil?
+                     "Fans: unknown (target: #{target_fan_speed.to_i}%)"
+                   elsif !target_fan_speed.nil? && target_fan_speed.to_i != fan_speed.to_i
+                     "Fans: #{fan_speed.to_i}% (target: #{target_fan_speed.to_i}%, held)"
+                   else
+                     "Fans: #{fan_speed.to_i}%"
+                   end
                  else
                    "Dell Automated Fan Speed (manual cutoff = #{MANUAL_CUTOFF})"
                  end
@@ -82,19 +111,121 @@ module DellIPMIFanCtrl
     warning_io.write(stderr) unless status.success?
     status.success?
   end
+
+  class Controller
+    attr_reader :applied_fan_speed, :manual
+
+    def initialize(decrease_interval:, decrease_step:, output: $stdout, manual_writer: nil, speed_writer: nil)
+      @decrease_interval = decrease_interval
+      @decrease_step = decrease_step
+      @output = output
+      @manual_writer = manual_writer || DellIPMIFanCtrl.method(:set_manual_fan_ctrl)
+      @speed_writer = speed_writer || DellIPMIFanCtrl.method(:set_fan_speed)
+      @applied_fan_speed = nil
+      @manual = nil
+      @last_status_at = nil
+      reset_decrease_window
+    end
+
+    def step(temp, now: Process.clock_gettime(Process::CLOCK_MONOTONIC))
+      desired_manual = temp < MANUAL_CUTOFF
+      target = DellIPMIFanCtrl.get_fan_speed(temp).to_i
+      previous_manual = @manual
+      mode_changed = false
+      speed_changed = false
+
+      if @manual_writer.call(desired_manual)
+        @manual = desired_manual
+        mode_changed = previous_manual != @manual
+        if mode_changed
+          @applied_fan_speed = nil
+          reset_decrease_window
+        end
+      end
+
+      if desired_manual
+        if @applied_fan_speed.nil? || target > @applied_fan_speed
+          if @speed_writer.call(target)
+            speed_changed = @applied_fan_speed != target
+            @applied_fan_speed = target
+            reset_decrease_window
+          end
+        elsif target == @applied_fan_speed
+          reset_decrease_window
+        else
+          start_or_update_decrease_window(target, now)
+          if decrease_due?(now)
+            next_speed = [@applied_fan_speed - @decrease_step, @highest_target_in_window].max
+            if @speed_writer.call(next_speed)
+              speed_changed = true
+              @applied_fan_speed = next_speed
+              restart_decrease_window(target, now)
+            end
+          end
+        end
+      else
+        reset_decrease_window
+      end
+
+      log_status(temp, target, desired_manual, now) if status_due?(mode_changed || speed_changed, now)
+    end
+
+    private
+
+    def start_or_update_decrease_window(target, now)
+      if @decrease_window_started_at.nil?
+        @decrease_window_started_at = now
+        @highest_target_in_window = target
+      else
+        @highest_target_in_window = [@highest_target_in_window, target].max
+      end
+    end
+
+    def decrease_due?(now)
+      (now - @decrease_window_started_at) >= @decrease_interval
+    end
+
+    def restart_decrease_window(target, now)
+      if target < @applied_fan_speed
+        @decrease_window_started_at = now
+        @highest_target_in_window = target
+      else
+        reset_decrease_window
+      end
+    end
+
+    def reset_decrease_window
+      @decrease_window_started_at = nil
+      @highest_target_in_window = nil
+    end
+
+    def status_due?(state_changed, now)
+      state_changed || @last_status_at.nil? || (now - @last_status_at) >= STATUS_LOG_INTERVAL
+    end
+
+    def log_status(temp, target, desired_manual, now)
+      reported_manual = @manual.nil? ? desired_manual : @manual
+      @output.puts DellIPMIFanCtrl.status_message(
+        temp,
+        manual: reported_manual,
+        fan_speed: @applied_fan_speed,
+        target_fan_speed: target,
+      )
+      @last_status_at = now
+    end
+  end
 end
 
 if $PROGRAM_NAME == __FILE__
+  $stdout.sync = true
+  controller = DellIPMIFanCtrl::Controller.new(
+    decrease_interval: DellIPMIFanCtrl.decrease_interval,
+    decrease_step: DellIPMIFanCtrl.decrease_step,
+  )
+
   loop do
     temp = DellIPMIFanCtrl.get_avg_temp
-    manual = temp < DellIPMIFanCtrl::MANUAL_CUTOFF
-    fan_speed = DellIPMIFanCtrl.get_fan_speed(temp)
-
-    puts DellIPMIFanCtrl.status_message(temp, manual: manual, fan_speed: fan_speed)
-
-    DellIPMIFanCtrl.set_manual_fan_ctrl(manual)
-    DellIPMIFanCtrl.set_fan_speed(fan_speed) if manual
-
+    controller.step(temp)
     sleep DellIPMIFanCtrl::DT
   end
 end
